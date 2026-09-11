@@ -109,8 +109,8 @@ async function sendEmail(
     });
     if (!response.ok) {
       const text = await response.text();
-      console.error("Resend delivery failure", response.status, text.slice(0, 180));
-      return { ok: false, error: `Resend API returned ${response.status}` };
+      console.error("Resend delivery failure", response.status, text.slice(0, 500));
+      return { ok: false, error: `Resend API returned ${response.status}: ${text.slice(0, 300)}` };
     }
     return { ok: true };
   } catch (err) {
