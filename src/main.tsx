@@ -1,4 +1,4 @@
-import React, { FormEvent, useEffect, useMemo, useState } from 'react';
+import React, { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   ArrowLeft,
@@ -28,7 +28,8 @@ import {
 } from 'lucide-react';
 import { BrowserRouter, Link, NavLink, Route, Routes, useLocation, useParams } from 'react-router-dom';
 import { docBySlug, docs, popularGuides, type DocPage as DocPageData } from './content';
-import { supabase } from './lib/supabase';
+import { AuthProvider } from './lib/auth';
+import { AdminRedirect, AdminSupportPage } from './admin/AdminSupportPage';
 import './styles.css';
 
 const DEMO_URL = 'https://pack-wpsu1enm.myshopify.com';
@@ -408,87 +409,126 @@ function DocArticlePage() {
 }
 
 type SupportForm = {
-  name: string;
+  firstName: string;
+  lastName: string;
   email: string;
   storeUrl: string;
+  themeName: string;
   subject: string;
-  category: string;
-  themeVersion: string;
-  pageUrl: string;
   description: string;
   consent: boolean;
   company: string;
 };
 
 const emptySupportForm: SupportForm = {
-  name: '', email: '', storeUrl: '', subject: '', category: '', themeVersion: '2.0.0', pageUrl: '', description: '', consent: false, company: ''
+  firstName: '', lastName: '', email: '', storeUrl: '', themeName: 'PALS', subject: '', description: '', consent: false, company: ''
 };
 
-const supportCategories = ['Installation', 'Theme Editor', 'Header and navigation', 'Product page', 'Collection page', 'Cart drawer', 'Pet Finder Quiz', 'Build a Box', 'Mobile layout', 'Performance', 'Accessibility', 'Bug report', 'Other'];
+type FormStatus = 'idle' | 'submitting' | 'success' | 'validation_error' | 'server_error';
 
-async function fileToPayload(file: File | null) {
-  if (!file) return null;
-  const bytes = new Uint8Array(await file.arrayBuffer());
-  let binary = '';
-  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
-  return { name: file.name, type: file.type || 'application/octet-stream', content: btoa(binary) };
-}
+const EDGE_FUNCTION_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/submit-support-ticket`;
+const ALLOWED_FILE_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.pdf'];
+const MAX_FILE_SIZE = 5 * 1024 * 1024;
 
 function SupportPage() {
   const [form, setForm] = useState<SupportForm>(emptySupportForm);
   const [file, setFile] = useState<File | null>(null);
-  const [status, setStatus] = useState<'idle' | 'sending' | 'success' | 'error'>('idle');
+  const [status, setStatus] = useState<FormStatus>('idle');
   const [message, setMessage] = useState('');
+  const [reference, setReference] = useState('');
+  const renderTimeRef = useRef(Date.now());
+  const successRef = useRef<HTMLDivElement>(null);
 
   const update = (key: keyof SupportForm, value: string | boolean) => setForm((current) => ({ ...current, [key]: value }));
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setMessage('');
+    setReference('');
+
+    if (!form.firstName.trim() || !form.lastName.trim()) {
+      setStatus('validation_error');
+      setMessage('Please enter your first and last name.');
+      return;
+    }
+    if (!form.email.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email)) {
+      setStatus('validation_error');
+      setMessage('Please enter a valid email address.');
+      return;
+    }
+    if (!form.storeUrl.trim() || !/^https?:\/\/.+\..+/.test(form.storeUrl)) {
+      setStatus('validation_error');
+      setMessage('Please enter a valid Shopify store URL.');
+      return;
+    }
     if (form.description.trim().length < 30) {
-      setStatus('error');
+      setStatus('validation_error');
       setMessage('Describe the issue in at least 30 characters.');
       return;
     }
-    if (file && file.size > 4 * 1024 * 1024) {
-      setStatus('error');
-      setMessage('The attachment must be 4 MB or smaller.');
+    if (file && file.size > MAX_FILE_SIZE) {
+      setStatus('validation_error');
+      setMessage('The attachment must be 5 MB or smaller.');
+      return;
+    }
+    if (file) {
+      const ext = file.name.toLowerCase().split('.').pop() || '';
+      if (!['png', 'jpg', 'jpeg', 'webp', 'pdf'].includes(ext)) {
+        setStatus('validation_error');
+        setMessage('Unsupported file format. Allowed: JPG, JPEG, PNG, WEBP, PDF.');
+        return;
+      }
+    }
+    if (!form.consent) {
+      setStatus('validation_error');
+      setMessage('Please acknowledge the privacy notice to continue.');
       return;
     }
 
-    setStatus('sending');
+    setStatus('submitting');
+
+    const formData = new FormData();
+    formData.append('firstName', form.firstName);
+    formData.append('lastName', form.lastName);
+    formData.append('name', `${form.firstName} ${form.lastName}`);
+    formData.append('email', form.email);
+    formData.append('storeUrl', form.storeUrl);
+    formData.append('themeName', form.themeName || 'PALS');
+    formData.append('subject', form.subject);
+    formData.append('description', form.description);
+    formData.append('consent', String(form.consent));
+    formData.append('company', form.company);
+    formData.append('_t', String(renderTimeRef.current));
+    if (file) formData.append('attachment', file);
+
     try {
-      const response = await fetch('/api/support', {
+      const response = await fetch(EDGE_FUNCTION_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...form, attachment: await fileToPayload(file), submittedAt: new Date().toISOString() })
+        headers: { Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}` },
+        body: formData,
       });
       const data = await response.json();
-      if (!response.ok || !data.success) throw new Error(data.error || 'The request could not be sent.');
-
-      const { error: dbError } = await supabase.from('support_requests').insert({
-        reference: data.reference,
-        name: form.name,
-        email: form.email.toLowerCase(),
-        store_url: form.storeUrl,
-        subject: form.subject,
-        category: form.category,
-        theme_version: form.themeVersion || null,
-        page_url: form.pageUrl || null,
-        description: form.description,
-        attachment_name: file?.name ?? null,
-      });
-      if (dbError) console.error('Database save failed for', data.reference, dbError.message);
+      if (!response.ok || !data.success) {
+        throw new Error(data.message || 'The request could not be sent. Try again later.');
+      }
 
       setStatus('success');
-      setMessage(`Request ${data.reference} was received. A confirmation was sent to ${form.email}.`);
+      setReference(data.reference || '');
+      setMessage(data.message || `Request ${data.reference} was received.`);
       setForm(emptySupportForm);
       setFile(null);
+      renderTimeRef.current = Date.now();
+
+      setTimeout(() => {
+        successRef.current?.focus();
+      }, 50);
     } catch (error) {
-      setStatus('error');
+      setStatus('server_error');
       setMessage(error instanceof Error ? error.message : 'The request could not be sent. Try again later.');
     }
   };
+
+  const statusClass = status === 'success' ? 'success' : status === 'validation_error' || status === 'server_error' ? 'error' : '';
 
   return (
     <div className="support-page page-wrap">
@@ -506,24 +546,44 @@ function SupportPage() {
       <form className="support-form" onSubmit={submit} noValidate>
         <div className="form-heading"><PawPrint aria-hidden="true" /><div><span>SUPPORT REQUEST</span><h2>Store and issue details</h2></div></div>
         <div className="form-grid">
-          <label><span>Full name *</span><input required autoComplete="name" value={form.name} onChange={(e) => update('name', e.target.value)} /></label>
-          <label><span>Email address *</span><input required type="email" autoComplete="email" value={form.email} onChange={(e) => update('email', e.target.value)} /></label>
+          <label><span>First name *</span><input required autoComplete="given-name" value={form.firstName} onChange={(e) => update('firstName', e.target.value)} /></label>
+          <label><span>Last name *</span><input required autoComplete="family-name" value={form.lastName} onChange={(e) => update('lastName', e.target.value)} /></label>
+          <label className="wide"><span>Email address *</span><input required type="email" autoComplete="email" value={form.email} onChange={(e) => update('email', e.target.value)} /></label>
           <label className="wide"><span>Shopify store URL *</span><input required type="url" inputMode="url" placeholder="https://your-store.myshopify.com" value={form.storeUrl} onChange={(e) => update('storeUrl', e.target.value)} /></label>
-          <label className="wide"><span>Subject *</span><input required value={form.subject} onChange={(e) => update('subject', e.target.value)} /></label>
-          <label><span>Issue category *</span><select required value={form.category} onChange={(e) => update('category', e.target.value)}><option value="">Select a category</option>{supportCategories.map((category) => <option key={category}>{category}</option>)}</select></label>
-          <label><span>Theme version</span><input value={form.themeVersion} onChange={(e) => update('themeVersion', e.target.value)} /></label>
-          <label className="wide"><span>Affected page URL</span><input type="url" inputMode="url" placeholder="https://your-store.com/products/example" value={form.pageUrl} onChange={(e) => update('pageUrl', e.target.value)} /></label>
+          <label><span>Theme name</span><input value={form.themeName} onChange={(e) => update('themeName', e.target.value)} readOnly /></label>
+          <label><span>Subject</span><input value={form.subject} onChange={(e) => update('subject', e.target.value)} placeholder="Brief summary of the issue" /></label>
           <label className="wide"><span>Description *</span><textarea required minLength={30} rows={7} placeholder="What happened, what did you expect, and how can we reproduce it?" value={form.description} onChange={(e) => update('description', e.target.value)} /><small>{form.description.length}/30 minimum characters</small></label>
           <div className="wide upload-field">
             <span>Attachment</span>
-            <label className="upload-control"><Upload aria-hidden="true" /><span>{file ? file.name : 'Add screenshot, PDF, text file or ZIP'}<small>PNG, JPG, WEBP, PDF, TXT or ZIP — maximum 4 MB</small></span><input type="file" accept=".png,.jpg,.jpeg,.webp,.pdf,.txt,.zip" onChange={(e) => setFile(e.target.files?.[0] ?? null)} /></label>
+            <label className="upload-control"><Upload aria-hidden="true" /><span>{file ? file.name : 'Add screenshot or PDF'}<small>PNG, JPG, JPEG, WEBP or PDF — maximum 5 MB</small></span><input type="file" accept={ALLOWED_FILE_EXTS.join(',')} onChange={(e) => setFile(e.target.files?.[0] ?? null)} /></label>
             {file && <button type="button" className="remove-file" onClick={() => setFile(null)}>Remove attachment</button>}
           </div>
           <label className="honeypot" aria-hidden="true"><span>Company</span><input tabIndex={-1} autoComplete="off" value={form.company} onChange={(e) => update('company', e.target.value)} /></label>
           <label className="wide consent"><input required type="checkbox" checked={form.consent} onChange={(e) => update('consent', e.target.checked)} /><span>I agree to the processing of this information for support purposes as described in the <Link to="/privacy">Privacy notice</Link>. *</span></label>
         </div>
-        {message && <div className={`form-status ${status}`} role={status === 'error' ? 'alert' : 'status'}>{status === 'success' ? <Check /> : <CircleHelp />}<span>{message}</span></div>}
-        <button className="button button-blue submit-button" type="submit" disabled={status === 'sending'}>{status === 'sending' ? 'Sending request…' : 'Send support request'} <ArrowRight aria-hidden="true" /></button>
+        {message && (
+          <div
+            ref={status === 'success' ? successRef : undefined}
+            tabIndex={status === 'success' ? -1 : undefined}
+            className={`form-status ${statusClass}`}
+            role={status === 'validation_error' || status === 'server_error' ? 'alert' : 'status'}
+            aria-live="polite"
+          >
+            {status === 'success' ? <Check /> : <CircleHelp />}
+            <span>
+              {status === 'success' && reference ? (
+                <><strong>Your request {reference} was received.</strong><br />{message}</>
+              ) : message}
+            </span>
+          </div>
+        )}
+        <button className="button button-blue submit-button" type="submit" disabled={status === 'submitting'} aria-busy={status === 'submitting'}>
+          {status === 'submitting' ? (
+            <><span className="admin-spinner admin-spinner-inline" aria-hidden="true" /> Sending request…</>
+          ) : (
+            <>Send support request <ArrowRight aria-hidden="true" /></>
+          )}
+        </button>
       </form>
     </div>
   );
@@ -586,10 +646,20 @@ function App() {
         <Route path="/changelog" element={<ChangelogPage />} />
         <Route path="/privacy" element={<LegalPage type="privacy" />} />
         <Route path="/terms" element={<LegalPage type="terms" />} />
+        <Route path="/admin" element={<AdminRedirect />} />
+        <Route path="/admin/support" element={<AdminSupportPage />} />
         <Route path="*" element={<NotFoundPage />} />
       </Routes>
     </Layout>
   );
 }
 
-createRoot(document.getElementById('root')!).render(<React.StrictMode><BrowserRouter><App /></BrowserRouter></React.StrictMode>);
+createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <AuthProvider>
+        <App />
+      </AuthProvider>
+    </BrowserRouter>
+  </React.StrictMode>
+);
