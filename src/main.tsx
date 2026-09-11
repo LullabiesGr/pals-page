@@ -28,6 +28,7 @@ import {
 } from 'lucide-react';
 import { BrowserRouter, Link, NavLink, Route, Routes, useLocation, useParams } from 'react-router-dom';
 import { docBySlug, docs, popularGuides, type DocPage as DocPageData } from './content';
+import { supabase } from './lib/supabase';
 import './styles.css';
 
 const DEMO_URL = 'https://pack-wpsu1enm.myshopify.com';
@@ -464,6 +465,21 @@ function SupportPage() {
       });
       const data = await response.json();
       if (!response.ok || !data.success) throw new Error(data.error || 'The request could not be sent.');
+
+      const { error: dbError } = await supabase.from('support_requests').insert({
+        reference: data.reference,
+        name: form.name,
+        email: form.email.toLowerCase(),
+        store_url: form.storeUrl,
+        subject: form.subject,
+        category: form.category,
+        theme_version: form.themeVersion || null,
+        page_url: form.pageUrl || null,
+        description: form.description,
+        attachment_name: file?.name ?? null,
+      });
+      if (dbError) console.error('Database save failed for', data.reference, dbError.message);
+
       setStatus('success');
       setMessage(`Request ${data.reference} was received. A confirmation was sent to ${form.email}.`);
       setForm(emptySupportForm);
